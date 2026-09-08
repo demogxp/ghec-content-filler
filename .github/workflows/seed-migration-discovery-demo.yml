@@ -1,0 +1,1260 @@
+# Migration discovery fixtures only; this workflow never performs a migration.
+# Documentation reviewed 2026-09-08:
+# https://docs.github.com/en/migrations/using-github-enterprise-importer/migrating-between-github-products/about-migrations-between-github-products
+# API reference: https://docs.github.com/en/rest (version 2026-03-10).
+#
+# Required bootstrap secret: DEMO_ADMIN_TOKEN, authorized for this disposable org.
+# Recommended: an org-owner classic PAT with repo, admin:org,
+# admin:repo_hook, admin:org_hook, project, security_events.
+# Authorize SAML SSO; comply with org PAT approval/IP/expiration policies.
+# No write:packages scope is needed: GHCR publishing uses GITHUB_TOKEN.
+# Fine-grained PAT / pre-minted GitHub App installation token alternative:
+# repository write: Administration, Contents, Issues,
+# Webhooks, Pages, Environments, Secrets, Variables, Dependabot secrets,
+# Codespaces secrets, Custom properties; read: Dependabot alerts.
+# organization write: Administration, Members, Webhooks, Projects, Secrets,
+# Variables, Custom properties, Codespaces secrets, Self-hosted runners.
+# Scope access to this repository AND the optional demo companion/fork repositories.
+# Endpoint/token-type support differs (notably Projects and Codespaces); failures
+# are reported. An installation token must remain valid for the job duration.
+# No App private key is created or stored. No human identity is impersonated.
+#
+# Effects outside demo-named objects: enables repository issues/wiki/discussions,
+# sets PR merge options, enables Actions PR creation/approval for this repository,
+# adds a topic, configures Pages only if no site exists,
+# optionally enables security features, and adds ONLY prefixed files to the
+# default branch for dependency discovery; creates .github/dependabot.yml only if
+# absent (canonical name required by GitHub; existing configuration is preserved).
+# Visibility/default branch are preserved.
+# include_org_settings changes the org base permission to 'none' (affects members
+# across ALL repositories). Other org policy settings are preserved. No invitations,
+# paid runners, external webhooks, real credentials, or external forks are created.
+# Demo namespace is reserved for this workflow. Secrets/variables use MIGRATION_DEMO_
+# because GitHub disallows hyphens in their names. Org resource names include repo ID.
+# Wiki initialization and the org default branch name may need the web UI.
+# Review the coverage artifact/summary after each run; CREATED includes reused data.
+
+name: Seed migration discovery demo
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_demo_environment:
+        description: "Type YES-SEED-DEMO-DATA (disposable organization only)"
+        required: true
+        type: string
+      seed_level:
+        description: Dataset size
+        type: choice
+        options: [full, minimal]
+        default: full
+      include_security_alerts:
+        description: Enable available security products and submit harmless fixtures
+        type: boolean
+        default: true
+      include_packages:
+        description: Publish a tiny organization-owned container package
+        type: boolean
+        default: true
+      include_org_settings:
+        description: Set organization base permission to none (all repositories)
+        type: boolean
+        default: true
+
+# Concurrency groups serialize this repository's runs. Repo-ID suffixes isolate
+# generated organization resources from other repositories' seed workflows.
+concurrency:
+  group: migration-demo-${{ github.repository_owner }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  seed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      discussions: write
+      statuses: write
+      deployments: write
+      actions: read
+      packages: write
+      pages: write
+      security-events: write
+    env:
+      DEMO_OWNER: ${{ github.repository_owner }}
+      DEMO_REPO: ${{ github.event.repository.name }}
+      DEMO_FULL_REPO: ${{ github.repository }}
+      DEMO_CONFIRM: ${{ inputs.confirm_demo_environment }}
+      DEMO_LEVEL: ${{ inputs.seed_level }}
+      DEMO_SECURITY: ${{ inputs.include_security_alerts }}
+      DEMO_PACKAGES: ${{ inputs.include_packages }}
+      DEMO_ORG_SETTINGS: ${{ inputs.include_org_settings }}
+      GH_PROMPT_DISABLED: '1'
+      GH_NO_UPDATE_NOTIFIER: '1'
+      GIT_TERMINAL_PROMPT: '0'
+    steps:
+      - name: Require intentional execution in an organization
+        env:
+          OWNER_TYPE: ${{ github.event.repository.owner.type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$DEMO_CONFIRM" != YES-SEED-DEMO-DATA || "$OWNER_TYPE" != Organization ]]; then
+            echo '::error::Requires YES-SEED-DEMO-DATA and an organization-owned repository.'
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/migration-demo"
+          printf 'DEMO_DIR=%s/migration-demo\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      # No checkout: no code, hooks, dependencies, or Dockerfiles from the target
+      # repository are executed with bootstrap privileges.
+      - name: Write self-contained seeder
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$DEMO_DIR/seed.py" <<'PY'
+          import base64
+          import gzip
+          import hashlib
+          import html
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import secrets
+          import subprocess
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          ROOT = Path(os.environ['DEMO_DIR'])
+          OWNER, REPO = os.environ['DEMO_OWNER'], os.environ['DEMO_REPO']
+          FULL = os.environ['DEMO_FULL_REPO']
+          API = os.environ['GITHUB_API_URL'].rstrip('/')
+          SERVER = os.environ['GITHUB_SERVER_URL'].rstrip('/')
+          GRAPHQL = os.environ['GITHUB_GRAPHQL_URL']
+          P = 'migration-demo-'
+          R = f'/repos/{FULL}'
+          O = f'/orgs/{OWNER}'
+          FULL_SEED = os.environ['DEMO_LEVEL'] == 'full'
+          TOKEN = os.environ.get('GH_TOKEN', '')
+          ADMIN = os.environ.get('DEMO_ADMIN_TOKEN', '')
+          MASKS = [x for x in (TOKEN, ADMIN) if x]
+          ROWS = {}
+          REQUIRED_FAILURES = []
+          # Inventory is the union of both source tables, both exclusion lists,
+          # organization migration, branch exceptions, and data in limit notes.
+          # Keys split compound documentation bullets so partial success is visible.
+          INVENTORY = {
+              'git': 'Git source / commit history', 'refs': 'Branches / tags / Git references',
+              'prs': 'Pull requests', 'issues': 'Issues', 'milestones': 'Milestones',
+              'wiki': 'Wikis', 'wiki_attachments': 'Wiki attachments',
+              'workflows': 'Actions workflow definitions', 'actions_settings': 'Actions repository permissions',
+              'commit_comments': 'Commit comments',
+              'repo_hooks': 'Repository webhooks (active)', 'org_hooks': 'Organization webhooks',
+              'topics': 'Repository topics', 'settings': 'Repository settings / visibility',
+              'protection': 'Branch protections', 'pages': 'Pages settings / content',
+              'autolinks': 'Autolink references', 'pr_settings': 'Pull request settings',
+              'delete_head': 'Automatic head-branch deletion', 'auto_merge': 'Auto-merge setting',
+              'merge': 'Merge commits / message settings', 'squash': 'Squash merge / message settings',
+              'rebase_setting': 'Rebase merge setting', 'releases': 'Releases',
+              'assets': 'Release assets / binary metadata', 'attachments': 'Issue / PR attachments',
+              'history': 'User history / attribution', 'audit': 'Audit logs',
+              'sarif': 'Code scanning results', 'codespaces': 'Codespaces repository secrets',
+              'org_codespaces': 'Codespaces organization secrets', 'statuses': 'Commit status checks',
+              'dependabot': 'Dependabot alerts', 'dependabot_secrets': 'Dependabot secrets',
+              'discussions': 'Repository discussions', 'issue_edits': 'Issue-comment edit history',
+              'pr_edits': 'PR-comment edit history', 'forks': 'Fork relationships',
+              'repo_secrets': 'Actions repository secrets', 'org_secrets': 'Actions organization secrets',
+              'repo_vars': 'Actions repository variables', 'org_vars': 'Actions organization variables',
+              'environments': 'Environments', 'env_protection': 'Environment protection',
+              'env_secrets': 'Environment secrets / variables', 'runners': 'Self-hosted runners',
+              'large_runners': 'Larger runners', 'runner_groups': 'Runner-group configuration', 'artifacts': 'Workflow artifacts',
+              'runs': 'Workflow run history', 'apps': 'GitHub Apps', 'installations': 'App installations',
+              'lfs': 'LFS objects / large binaries', 'comment_links': 'Links to comments / events',
+              'rebase_links': 'Commit links for rebase-merged PRs', 'mentions': 'User / team / org mentions',
+              'packages': 'Organization-owned GitHub Packages', 'projects': 'Projects (current experience)',
+              'reciprocal': 'Reciprocal mention links', 'cross_refs': 'Cross-repository issue / PR references',
+              'secret_remediation': 'Secret scanning remediation states', 'personal_repos': 'User-owned repositories',
+              'activity': 'Repository activity feed', 'properties': 'Repository custom-property values',
+              'property_definitions': 'Organization property definitions', 'stars': 'Repository stars',
+              'watchers': 'Repository watchers', 'rulesets': 'Repository rulesets',
+              'org_rulesets': 'Organization rulesets', 'subissues': 'Sub-issues',
+              'tag_protection': 'Legacy tag protection', 'access': 'User repository access',
+              'collaborators': 'Repository collaborators',
+              'profiles': 'User profiles', 'ssh': 'User SSH keys', 'signing': 'User signing keys',
+              'pats': 'User personal access tokens', 'hook_secrets': 'Webhook secrets',
+              'teams': 'Teams', 'team_access': 'Team repository access', 'team_members': 'Team membership',
+              'repositories': 'Organization repositories', 'member_privileges': 'Member privileges / defaults',
+              'default_branch': 'Organization default branch name', 'codeowners': 'CODEOWNERS team references',
+              'bypass': 'PR bypass actors', 'last_push': 'Most-recent-push approval',
+              'required_deploy': 'Required successful deployments', 'lock': 'Locked branch',
+              'restrict_create': 'Restricted matching-branch creation', 'force': 'Force pushes allowed',
+              'exceptions': 'Branch protection actor exceptions', 'force_actors': 'Selected force-push actors',
+              'labels': 'Labels', 'comments': 'Issue comments', 'pr_comments': 'PR comments / reviews',
+              'security_config': 'Repository security configuration', 'secret_config': 'Secret scanning configuration',
+              'dependabot_config': 'Dependabot / dependency graph configuration',
+              'deployments': 'Deployments', 'metadata': 'Repository metadata',
+              'search': 'Code search index', 'mannequins': 'Migration mannequins',
+          }
+
+          def clean(value):
+              text = str(value)
+              for value in MASKS:
+                  text = text.replace(value, '[REDACTED]')
+              return text
+
+          def save():
+              temp = ROOT / 'coverage.tmp'
+              temp.write_text(json.dumps(ROWS, indent=2), encoding='utf-8')
+              temp.replace(ROOT / 'coverage.json')
+
+          def record(keys, status, resource='', mechanism='', notes=''):
+              for key in keys.split():
+                  assert key in INVENTORY, key
+                  ROWS[key] = dict(item=INVENTORY[key], status=status, resource=clean(resource),
+                                   mechanism=mechanism, notes=clean(notes)[:1800])
+              save()
+
+          class APIError(Exception):
+              def __init__(self, method, path, status, message):
+                  self.status = status
+                  super().__init__(f'{method} {path}: HTTP {status}: {clean(message)}')
+
+          # Never forward authorization to a redirect target; upload URLs are checked.
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          OPENER = urllib.request.build_opener(NoRedirect)
+          RESPONSE_LINK = ''
+          LAST_WRITE = 0.0
+
+          def api(path, method='GET', data=None, admin=False, missing=False, raw=None):
+              global RESPONSE_LINK, LAST_WRITE
+              token = ADMIN if admin else TOKEN
+              if not token:
+                  raise APIError(method, path, 401, 'DEMO_ADMIN_TOKEN missing' if admin else 'GITHUB_TOKEN missing')
+              url = path if path.startswith('https://') else API + path
+              host = urllib.parse.urlparse(url).hostname
+              api_host = urllib.parse.urlparse(API).hostname
+              allowed = {api_host, api_host.replace('api.', 'uploads.', 1)}
+              if host not in allowed:
+                  raise RuntimeError('Refused credential forwarding to unexpected host')
+              body = raw if raw is not None else (json.dumps(data).encode() if data is not None else None)
+              headers = {'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + token,
+                         'X-GitHub-Api-Version': '2026-03-10', 'User-Agent': 'migration-demo-seeder',
+                         'Content-Type': 'application/octet-stream' if raw is not None else 'application/json'}
+              # Retry only reads and idempotent PUTs. Ambiguous POSTs must be
+              # reconciled by the next run's lookup, not blindly duplicated.
+              for attempt in range(4):
+                  try:
+                      if method != 'GET':
+                          # GitHub recommends >=1 second between mutative requests.
+                          time.sleep(max(0, 1.0 - (time.monotonic() - LAST_WRITE)))
+                          LAST_WRITE = time.monotonic()
+                      with OPENER.open(urllib.request.Request(url, data=body, headers=headers, method=method), timeout=45) as response:
+                          RESPONSE_LINK = response.headers.get('Link', '')
+                          payload = response.read()
+                          return json.loads(payload) if payload else {}
+                  except urllib.error.HTTPError as error:
+                      payload = error.read().decode('utf-8', 'replace')
+                      if error.code == 404 and missing:
+                          return None
+                      retryable = error.code in (429, 500, 502, 503, 504) or (
+                          error.code == 403 and ('rate limit' in payload.lower() or error.headers.get('Retry-After')))
+                      if retryable and method in ('GET', 'PUT') and attempt < 3:
+                          delay = min(60, max(2 ** (attempt + 1), int(error.headers.get('Retry-After', '0'))))
+                          time.sleep(delay)
+                          continue
+                      raise APIError(method, path, error.code, payload[:1200]) from None
+
+          def listing(path, admin=False, key=None):
+              result = []
+              next_path = path + ('&' if '?' in path else '?') + 'per_page=100'
+              for _ in range(1000):
+                  value = api(next_path, admin=admin)
+                  batch = value[key] if key else value
+                  if not isinstance(batch, list):
+                      raise RuntimeError('Unexpected pagination shape for ' + path)
+                  result.extend(batch)
+                  next_link = re.search(r'<([^>]+)>;\s*rel="next"', RESPONSE_LINK)
+                  if not next_link:
+                      return result
+                  next_path = next_link.group(1)
+              raise RuntimeError('Pagination bound exceeded; refusing incomplete lookup')
+
+          def graphql(query, variables, admin=True):
+              value = api(GRAPHQL, 'POST', {'query': query, 'variables': variables}, admin=admin)
+              if value.get('errors'):
+                  raise RuntimeError('GraphQL: ' + clean(json.dumps(value['errors']))[:1200])
+              return value['data']
+
+          def run(keys, mechanism, function, required=False, enabled=True):
+              if not enabled:
+                  record(keys, 'SKIPPED', mechanism=mechanism, notes='Disabled by workflow input / minimal seed.')
+                  return None
+              try:
+                  print('Seeding ' + keys + ' ...', flush=True)
+                  result = function()
+                  for key in keys.split():
+                      if ROWS[key]['status'] == 'NOT ATTEMPTED':
+                          record(key, 'CREATED', str(result or FULL), mechanism, 'Created or reused after lookup.')
+                  return result
+              except Exception as error:
+                  status = 'FAILED (REQUIRED)' if required else 'FAILED (OPTIONAL)'
+                  if not required and isinstance(error, APIError) and error.status in (403, 404):
+                      status = 'REQUIRES ENTERPRISE/ORG FEATURE OR LICENSE'
+                  # Preserve individually successful rows when the rest of a group fails.
+                  for key in keys.split():
+                      if ROWS[key]['status'] == 'NOT ATTEMPTED':
+                          record(key, status, mechanism=mechanism, notes=str(error))
+                  print(clean(f'{keys}: {status}: {error}'))
+                  if required:
+                      REQUIRED_FAILURES.append(keys)
+                  return None
+
+          def command(args, *, cwd=None, admin=False, stdin=None, timeout=180):
+              env = dict(os.environ)
+              env['GH_TOKEN'] = ADMIN if admin else TOKEN
+              env['GH_ENTERPRISE_TOKEN'] = env['GH_TOKEN']
+              # Subprocesses receive only the credential they actually need.
+              env.pop('DEMO_ADMIN_TOKEN', None)
+              env['GH_HOST'] = urllib.parse.urlparse(SERVER).hostname
+              env['GIT_ASKPASS'] = str(ROOT / 'askpass.sh')
+              env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+              env['GIT_CONFIG_NOSYSTEM'] = '1'
+              result = subprocess.run(args, cwd=cwd, env=env, input=stdin,
+                                      capture_output=True, text=True, timeout=timeout)
+              if result.returncode:
+                  # stdout may contain credentials with some CLIs; never dump it.
+                  raise RuntimeError(args[0] + ' failed: ' + clean(result.stderr[-1400:]))
+              return result.stdout.strip()
+
+          def by_name(path, field, name, data, *, admin=False, update='PATCH', id_field='id'):
+              existing = next((x for x in listing(path, admin) if x.get(field) == name), None)
+              if existing:
+                  return api(f"{path.split('?')[0]}/{existing[id_field]}", update, data, admin=admin) if update else existing
+              return api(path.split('?')[0], 'POST', data, admin=admin)
+
+          def branch(name, sha, admin=False):
+              assert name.startswith(P)
+              value = api(R + '/git/ref/heads/' + name, admin=admin, missing=True)
+              return value or api(R + '/git/refs', 'POST', {'ref': 'refs/heads/' + name, 'sha': sha}, admin=admin)
+
+          def put_files(name, files, message, admin=False):
+              assert name.startswith(P) or name == DEFAULT
+              ref = api(R + '/git/ref/heads/' + urllib.parse.quote(name, safe=''), admin=admin)
+              head = ref['object']['sha']
+              changes = []
+              for path, content in files.items():
+                  # A filename/path segment is prefixed. No existing non-demo file is changed.
+                  assert any(part.startswith(P) for part in path.split('/')), path
+                  old = api(R + '/contents/' + path + '?ref=' + urllib.parse.quote(name, safe=''), admin=admin, missing=True)
+                  if old and old.get('encoding') == 'base64' and base64.b64decode(old['content']).decode() == content:
+                      continue
+                  changes.append({'path': path, 'mode': '100644', 'type': 'blob', 'content': content})
+              if not changes:
+                  return head
+              commit = api(R + '/git/commits/' + head, admin=admin)
+              tree = api(R + '/git/trees', 'POST', {'base_tree': commit['tree']['sha'], 'tree': changes}, admin=admin)
+              new = api(R + '/git/commits', 'POST', {'message': message, 'tree': tree['sha'], 'parents': [head]}, admin=admin)
+              api(R + '/git/refs/heads/' + urllib.parse.quote(name, safe=''), 'PATCH', {'sha': new['sha'], 'force': False}, admin=admin)
+              return new['sha']
+
+          def issue_comment(number, suffix, body):
+              marker = f'<!-- {P}{suffix} -->'
+              path = R + f'/issues/{number}/comments'
+              old = next((x for x in listing(path) if (x.get('body') or '').startswith(marker)), None)
+              final = marker + '\n' + body
+              if old:
+                  if old['body'] != final:
+                      return api(R + f"/issues/comments/{old['id']}", 'PATCH', {'body': final})
+                  return old
+              # Two versions, only on initial creation, produce bounded edit history.
+              new = api(path, 'POST', {'body': marker + '\nInitial demo comment.'})
+              return api(R + f"/issues/comments/{new['id']}", 'PATCH', {'body': final})
+
+          def seed_core():
+              label_names = []
+              for suffix, color in [('bug', 'd73a4a'), ('enhancement', 'a2eeef'), ('triage', 'fbca04')]:
+                  name = P + suffix
+                  old = api(R + '/labels/' + name, missing=True)
+                  api(R + ('/labels/' + name if old else '/labels'), 'PATCH' if old else 'POST',
+                      {'name': name, 'color': color, 'description': 'Disposable discovery fixture'})
+                  label_names.append(name)
+              record('labels', 'CREATED', ', '.join(label_names), 'REST labels')
+              milestone = by_name(R + '/milestones?state=all', 'title', P + 'milestone',
+                                  {'title': P + 'milestone', 'description': 'Discovery acceptance', 'state': 'open'}, id_field='number')
+              record('milestones', 'CREATED', milestone['html_url'], 'REST milestones')
+              issues = []
+              all_issues = listing(R + '/issues?state=all')
+              for index, suffix in enumerate(['tracking', 'bug-report', 'completed']):
+                  title = P + suffix
+                  old = next((x for x in all_issues if x['title'] == title and 'pull_request' not in x), None)
+                  body = 'Harmless disposable migration discovery fixture.'
+                  if issues:
+                      body += f"\nRelated to #{issues[0]['number']}."
+                  payload = {'title': title, 'body': body, 'labels': [label_names[index]], 'milestone': milestone['number']}
+                  value = api(R + (f"/issues/{old['number']}" if old else '/issues'), 'PATCH' if old else 'POST', payload)
+                  desired = 'closed' if index == 2 else 'open'
+                  if value['state'] != desired:
+                      value = api(R + f"/issues/{value['number']}", 'PATCH', {'state': desired})
+                  issues.append(value)
+              record('issues', 'CREATED', ', '.join('#' + str(x['number']) for x in issues), 'REST issues', 'Two open; one closed; milestone and label associations.')
+              comment = issue_comment(issues[0]['number'], 'issue-comment', f"Edited discovery comment; see #{issues[1]['number']}.")
+              record('comments issue_edits', 'CREATED', comment['html_url'], 'POST then PATCH issue comment', 'Initial and edited versions; reruns reuse the comment.')
+              issue_comment(issues[1]['number'], 'comment-link', 'Link to a specific comment: ' + comment['html_url'])
+              record('comment_links', 'CREATED', comment['html_url'], 'Issue comment permalink')
+              record('reciprocal', 'TRIGGERED/GENERATED INDIRECTLY', FULL, 'GitHub reference processing', 'Issue references trigger timeline backlinks; no fabricated events.')
+              return issues
+
+          def seed_git():
+              base = P + 'base'
+              branch(base, INFO_SHA)
+              put_files(base, {P + 'content/README.md': '# Migration discovery demo\nHarmless fixture data.\n'}, P + 'initial content')
+              sha = put_files(base, {P + 'content/example.txt': 'First line\nSecond line\n'}, P + 'second commit')
+              branch(P + 'feature', sha)
+              feature = put_files(P + 'feature', {P + 'content/example.txt': 'First line\nSecond line\nFeature line\n'}, P + 'feature commit')
+              for suffix in ('protected', 'locked', 'rebase-base'):
+                  branch(P + suffix, sha)
+              tag = P + 'v1.0.0'
+              if not api(R + '/git/ref/tags/' + tag, missing=True):
+                  obj = api(R + '/git/tags', 'POST', {'tag': tag, 'message': 'Discovery annotated tag', 'object': sha, 'type': 'commit'})
+                  api(R + '/git/refs', 'POST', {'ref': 'refs/tags/' + tag, 'sha': obj['sha']})
+              record('git refs', 'CREATED', base + ', ' + P + 'feature, ' + tag, 'Git database REST API', 'Several real commits; existing demo refs are reused without force-pushing.')
+              return sha, feature
+
+          def seed_prs():
+              title = P + 'feature'
+              existing = next((x for x in listing(R + '/pulls?state=all') if x['title'] == title and x['head']['ref'] == P + 'feature'), None)
+              pr = existing or api(R + '/pulls', 'POST', {'title': title, 'head': P + 'feature', 'base': P + 'base',
+                  'body': f"References #{ISSUES[0]['number']}. Demo review metadata.", 'draft': False})
+              record('prs', 'CREATED', pr['html_url'], 'REST pull requests', 'Org policy must allow Actions to create PRs; no automatic elevated fallback.')
+              comment = issue_comment(pr['number'], 'pr-comment', f"Edited PR comment; references #{ISSUES[1]['number']}.")
+              record('pr_edits', 'CREATED', comment['html_url'], 'POST/PATCH PR issue comment')
+              return pr
+
+          def reviews():
+              body = P + 'review: harmless COMMENT review (not approval).'
+              old = next((x for x in listing(R + f"/pulls/{PR['number']}/reviews") if x.get('body') == body), None)
+              review = old or api(R + f"/pulls/{PR['number']}/reviews", 'POST', {'body': body, 'event': 'COMMENT',
+                  'commit_id': FEATURE_SHA, 'comments': [{'path': P + 'content/example.txt', 'line': 3, 'side': 'RIGHT',
+                                                       'body': P + 'inline: inspect this harmless addition.'}]})
+              return review.get('html_url', PR['html_url'])
+
+          def subissues():
+              path = R + f"/issues/{ISSUES[0]['number']}/sub_issues"
+              if not any(x['id'] == ISSUES[1]['id'] for x in listing(path)):
+                  api(path, 'POST', {'sub_issue_id': ISSUES[1]['id']})
+              return ISSUES[0]['html_url']
+
+          def commit_metadata():
+              body = P + 'commit-comment: discoverable fixture.'
+              path = R + '/commits/' + BASE_SHA + '/comments'
+              if not any(x['body'] == body for x in listing(path)):
+                  api(path, 'POST', {'body': body})
+              record('commit_comments', 'CREATED', BASE_SHA, 'REST commit comments')
+              path = R + '/commits/' + FEATURE_SHA + '/statuses'
+              if not any(x['context'] == P + 'check' and x['state'] == 'success' for x in listing(path)):
+                  api(R + '/statuses/' + FEATURE_SHA, 'POST', {'state': 'success', 'context': P + 'check', 'description': 'Harmless demo status'})
+              record('statuses', 'CREATED', FEATURE_SHA, 'REST commit statuses', 'Stable context; reruns do not append duplicate successes.')
+
+          def rebase_pr():
+              head, base = P + 'rebase-feature', P + 'rebase-base'
+              old = next((x for x in listing(R + '/pulls?state=all') if x['title'] == P + 'rebase-example'), None)
+              if old and old.get('merged_at'):
+                  return old['html_url']
+              branch(head, BASE_SHA)
+              put_files(head, {P + 'content/rebased.txt': 'Rebase example\n'}, P + 'rebase fixture')
+              pr = old or api(R + '/pulls', 'POST', {'title': P + 'rebase-example', 'head': head, 'base': base,
+                  'body': f"Rebase-only fixture. References #{ISSUES[0]['number']}."})
+              result = api(R + f"/pulls/{pr['number']}/merge", 'PUT', {'merge_method': 'rebase'})
+              if not result.get('merged'):
+                  raise RuntimeError('Rebase merge was not confirmed: ' + str(result))
+              return pr['html_url']
+          def repo_settings():
+              values = {'has_issues': True, 'has_wiki': True, 'has_discussions': True,
+                        'delete_branch_on_merge': True, 'allow_auto_merge': True,
+                        'allow_merge_commit': True, 'allow_squash_merge': True, 'allow_rebase_merge': True,
+                        'merge_commit_title': 'PR_TITLE', 'merge_commit_message': 'PR_BODY',
+                        'squash_merge_commit_title': 'PR_TITLE', 'squash_merge_commit_message': 'PR_BODY'}
+              result = api(R, 'PATCH', values, admin=True)
+              for key, field in [('delete_head', 'delete_branch_on_merge'), ('auto_merge', 'allow_auto_merge'),
+                                 ('merge', 'allow_merge_commit'), ('squash', 'allow_squash_merge'), ('rebase_setting', 'allow_rebase_merge')]:
+                  record(key, 'CONFIGURED' if result.get(field) else 'FAILED (OPTIONAL)', FULL, 'PATCH repository', f'{field}={result.get(field)}')
+              record('settings pr_settings', 'CONFIGURED', FULL, 'PATCH repository', 'Enabled issues/wiki/discussions and merge options; visibility preserved: ' + result['visibility'])
+              return result
+
+          def topics():
+              names = api(R + '/topics')['names']
+              if P + 'discovery' not in names:
+                  api(R + '/topics', 'PUT', {'names': names + [P + 'discovery']}, admin=True)
+              return P + 'discovery'
+
+          def actions_settings():
+              path = R + '/actions/permissions/workflow'
+              old = api(path, admin=True)
+              if not old.get('can_approve_pull_request_reviews'):
+                  api(path, 'PUT', {'can_approve_pull_request_reviews': True}, admin=True)
+              current = api(path, admin=True)
+              if not current.get('can_approve_pull_request_reviews'):
+                  raise RuntimeError('Actions PR creation/approval remains disabled by policy')
+              record('actions_settings', 'CONFIGURED', FULL, 'Repository workflow-permissions API',
+                     'Actions may create/approve PRs. Default workflow token permissions preserved; this workflow submits COMMENT reviews only.')
+
+          def teams():
+              team = api(O + '/teams/' + ORG_NAME + '-team', admin=True, missing=True)
+              if not team:
+                  team = api(O + '/teams', 'POST', {'name': ORG_NAME + '-team', 'privacy': 'closed',
+                      'description': 'Disposable migration discovery team'}, admin=True)
+              record('teams', 'CREATED', team['html_url'], 'REST teams')
+              api(O + f"/teams/{team['slug']}/repos/{FULL}", 'PUT', {'permission': 'push'}, admin=True)
+              record('team_access', 'CONFIGURED', team['html_url'], 'PUT team repository permission', 'Write access for demo team only.')
+              return team
+
+          def team_members():
+              # Only add the dispatching actor if ALREADY an active org member.
+              # Do not invite anyone or alter their organization role.
+              actor = os.environ['GITHUB_ACTOR']
+              membership = api(O + '/memberships/' + actor, admin=True)
+              if membership['state'] != 'active':
+                  raise RuntimeError('Dispatching actor is not an active organization member')
+              api(O + f"/teams/{TEAM['slug']}/memberships/{actor}", 'PUT', {'role': 'member'}, admin=True)
+              record('team_members', 'CONFIGURED', actor, 'PUT team membership', 'Existing org member only; no org invitation.')
+              record('access', 'CONFIGURED', TEAM['html_url'], 'Team membership + repository permission',
+                     'User access is represented through the demo team; no external collaborator invitation.')
+
+          def org_settings():
+              before = api(O, admin=True)
+              result = api(O, 'PATCH', {'default_repository_permission': 'none'}, admin=True)
+              if result.get('default_repository_permission') != 'none':
+                  raise RuntimeError('Org default permission update not confirmed')
+              record('member_privileges', 'CONFIGURED', OWNER, 'PATCH organization',
+                     f"Base permission {before.get('default_repository_permission')} -> none; applies to ALL org repositories.")
+
+          def collaborators():
+              actor = os.environ['GITHUB_ACTOR']
+              membership = api(O + '/memberships/' + actor, admin=True)
+              if membership.get('state') != 'active':
+                  record('collaborators', 'REQUIRES EXISTING EXTERNAL ACTOR', actor, 'Organization membership check',
+                         'Actor is not an active org member; no invitation sent.')
+                  return
+              permission = api(R + '/collaborators/' + actor + '/permission', admin=True)
+              role = permission.get('role_name', permission.get('permission'))
+              if role not in ('none', 'read', 'triage', 'write'):
+                  record('collaborators', 'CONFIGURED', actor, 'GET collaborator permission',
+                         'Existing elevated/custom role preserved: ' + str(role) + '; no access downgrade.')
+                  return
+              api(R + '/collaborators/' + actor, 'PUT', {'permission': 'push'}, admin=True)
+              record('collaborators', 'CONFIGURED', actor, 'PUT existing org member as collaborator', 'Write access; existing active org member only, no external invitation.')
+
+          def org_default():
+              value = api(O, admin=True).get('default_repository_branch', 'not returned')
+              record('default_branch', 'API DOES NOT SUPPORT CREATION', OWNER, 'GET organization; Settings UI for write',
+                     'Observed default: ' + str(value) + '. PATCH organization does not document this writable parameter; set in organization Settings > Repository defaults.')
+
+          def webhook(org=False):
+              path = (O if org else R) + '/hooks'
+              # .invalid is reserved, so no repository payload reaches a third party.
+              # Active=true represents GEI active hooks; deliveries intentionally fail DNS.
+              url = 'https://migration-demo.invalid/' + ORG_NAME + ('/org' if org else '/repo')
+              old = next((x for x in listing(path, admin=True) if x.get('config', {}).get('url') == url), None)
+              secret = 'demo-' + secrets.token_urlsafe(40)
+              MASKS.append(secret)
+              data = {'active': True, 'events': ['repository'] if org else ['issues'],
+                      'config': {'url': url, 'content_type': 'json', 'insecure_ssl': '0', 'secret': secret}}
+              if not old:
+                  data['name'] = 'web'
+              value = api(path + (f"/{old['id']}" if old else ''), 'PATCH' if old else 'POST', data, admin=True)
+              record('org_hooks' if org else 'repo_hooks', 'CONFIGURED', url, 'REST webhooks', 'Active hook with reserved .invalid sink; delivery failure is intentional.')
+              record('hook_secrets', 'CONFIGURED', url, 'Webhook config.secret', 'Random non-production value; never logged; rotated on rerun.')
+              return value['id']
+
+          def autolinks():
+              prefix = 'migration-demo-REF-'
+              if not any(x['key_prefix'] == prefix for x in listing(R + '/autolinks', True)):
+                  api(R + '/autolinks', 'POST', {'key_prefix': prefix, 'url_template': SERVER + '/' + FULL + '/issues/<num>',
+                                               'is_alphanumeric': False}, admin=True)
+              return prefix
+
+          def properties():
+              name = ORG_NAME + '-stage'
+              api(O + '/properties/schema/' + name, 'PUT', {'value_type': 'single_select', 'required': False,
+                  'allowed_values': ['discovery', 'validation'], 'description': 'Disposable discovery property'}, admin=True)
+              record('property_definitions', 'CONFIGURED', name, 'PUT organization property schema')
+              api(R + '/properties/values', 'PATCH', {'properties': [{'property_name': name, 'value': 'discovery'}]}, admin=True)
+              record('properties', 'CONFIGURED', name + '=discovery', 'PATCH repository property values')
+
+          def environment():
+              path = R + '/environments/' + P + 'environment'
+              value = api(path, 'PUT', {'deployment_branch_policy': {'protected_branches': False, 'custom_branch_policies': True}}, admin=True)
+              record('environments', 'CONFIGURED', P + 'environment', 'PUT repository environment')
+              return value
+
+          def env_protection():
+              path = R + '/environments/' + P + 'environment'
+              policies = listing(path + '/deployment-branch-policies', True, 'branch_policies')
+              if not any(x['name'] == P + '*' for x in policies):
+                  api(path + '/deployment-branch-policies', 'POST', {'name': P + '*', 'type': 'branch'}, admin=True)
+              api(path, 'PUT', {'wait_timer': 1, 'prevent_self_review': True,
+                               'deployment_branch_policy': {'protected_branches': False, 'custom_branch_policies': True}}, admin=True)
+              record('env_protection', 'CONFIGURED', P + 'environment', 'Environment / branch-policy REST APIs',
+                     'Demo branches only; one-minute wait timer. Workflow job itself is not gated by this environment.')
+
+          def demo_secret(scope, app='actions'):
+              # gh secret set performs libsodium sealed-box encryption locally using
+              # the destination public key. Plaintext is supplied ONLY on stdin.
+              # https://cli.github.com/manual/gh_secret_set
+              value = 'demo-' + secrets.token_urlsafe(48)
+              MASKS.append(value)
+              name = 'MIGRATION_DEMO_' + (str(INFO['id']) + '_' if scope == 'org' else '') + app.upper() + '_SECRET'
+              args = ['gh', 'secret', 'set', name, '--app', app]
+              if scope == 'org':
+                  args += ['--org', OWNER, '--visibility', 'selected', '--repos', REPO]
+              else:
+                  args += ['--repo', FULL]
+                  if scope == 'env':
+                      args += ['--env', P + 'environment']
+              command(args, admin=True, stdin=value)
+              return name
+
+          def variable(scope):
+              path = O + '/actions/variables' if scope == 'org' else (
+                  R + '/environments/' + P + 'environment/variables' if scope == 'env' else R + '/actions/variables')
+              name = 'MIGRATION_DEMO_' + (str(INFO['id']) + '_' if scope == 'org' else '') + 'MODE'
+              old = api(path + '/' + name, admin=True, missing=True)
+              data = {'name': name, 'value': 'discovery-only'}
+              if scope == 'org':
+                  data.update(visibility='selected', selected_repository_ids=[INFO['id']])
+              api(path + ('/' + name if old else ''), 'PATCH' if old else 'POST', data, admin=True)
+              return name
+
+          def protection():
+              data = {'required_status_checks': {'strict': True, 'contexts': [P + 'check']}, 'enforce_admins': False,
+                      'required_pull_request_reviews': {'dismiss_stale_reviews': True, 'require_last_push_approval': True,
+                                                       'required_approving_review_count': 1},
+                      'restrictions': None, 'allow_force_pushes': True, 'allow_deletions': False,
+                      'required_conversation_resolution': True}
+              api(R + '/branches/' + P + 'protected/protection', 'PUT', data, admin=True)
+              record('protection last_push force', 'CONFIGURED', P + 'protected', 'PUT branch protection', 'Demo branch only; status check and last-push review required.')
+              return data
+
+          def protection_actors():
+              data = json.loads(json.dumps(PROTECTION))
+              data['required_pull_request_reviews']['dismissal_restrictions'] = {'users': [], 'teams': [TEAM['slug']]}
+              data['required_pull_request_reviews']['bypass_pull_request_allowances'] = {'users': [], 'teams': [TEAM['slug']]}
+              data.update(restrictions={'users': [], 'teams': [TEAM['slug']], 'apps': []}, block_creations=True)
+              api(R + '/branches/' + P + 'protected/protection', 'PUT', data, admin=True)
+              record('bypass exceptions restrict_create', 'CONFIGURED', P + 'protected', 'PUT branch protection', 'Existing demo team is the actor exception; no non-demo branch is protected.')
+
+          def locked_branch():
+              api(R + '/branches/' + P + 'locked/protection', 'PUT', {'required_status_checks': None,
+                  'enforce_admins': False, 'required_pull_request_reviews': None, 'restrictions': None, 'lock_branch': True}, admin=True)
+              return P + 'locked'
+
+          def graphql_protection():
+              # REST lacks requiredDeploymentEnvironments and selected force-push
+              # actors. Query paginated GraphQL rules and update ONLY the demo rule.
+              cursor = None
+              found = None
+              while True:
+                  result = graphql('''query($owner:String!,$name:String!,$cursor:String) {
+                    repository(owner:$owner,name:$name) { branchProtectionRules(first:100,after:$cursor) {
+                      nodes { id pattern } pageInfo { hasNextPage endCursor }
+                    } }
+                  }''', {'owner': OWNER, 'name': REPO, 'cursor': cursor})['repository']['branchProtectionRules']
+                  found = next((x for x in result['nodes'] if x['pattern'] == P + 'protected'), found)
+                  if not result['pageInfo']['hasNextPage']:
+                      break
+                  cursor = result['pageInfo']['endCursor']
+              if not found:
+                  raise RuntimeError('Demo branch protection rule not visible in GraphQL')
+              graphql('''mutation($input:UpdateBranchProtectionRuleInput!) {
+                updateBranchProtectionRule(input:$input) { branchProtectionRule { id } }
+              }''', {'input': {'branchProtectionRuleId': found['id'], 'requiresDeployments': True,
+                              'requiredDeploymentEnvironments': [P + 'environment']}})
+              record('required_deploy', 'CONFIGURED', P + 'protected', 'GraphQL updateBranchProtectionRule')
+              if TEAM:
+                  graphql('''mutation($input:UpdateBranchProtectionRuleInput!) {
+                    updateBranchProtectionRule(input:$input) { branchProtectionRule { id } }
+                  }''', {'input': {'branchProtectionRuleId': found['id'], 'allowsForcePushes': True,
+                                  'bypassForcePushActorIds': [TEAM['node_id']]}})
+                  record('force_actors', 'CONFIGURED', TEAM['slug'], 'GraphQL bypassForcePushActorIds')
+              else:
+                  record('force_actors', 'REQUIRES EXISTING EXTERNAL ACTOR', mechanism='GraphQL', notes='Demo team creation failed; an eligible actor is required.')
+
+          def rulesets(org=False):
+              path = (O if org else R) + '/rulesets'
+              name = ORG_NAME + '-ruleset' if org else P + 'ruleset'
+              conditions = {'ref_name': {'include': ['refs/heads/' + P + 'rules-*'], 'exclude': []}}
+              if org:
+                  conditions['repository_id'] = {'repository_ids': [INFO['id']]}
+              payload = {'name': name, 'target': 'branch', 'enforcement': 'active', 'conditions': conditions,
+                         'rules': [{'type': 'deletion'}, {'type': 'non_fast_forward'}]}
+              # Exclude inherited rulesets from repository updates.
+              values = listing(path + ('' if org else '?includes_parents=false'), True)
+              old = next((x for x in values if x['name'] == name), None)
+              value = api(path + (f"/{old['id']}" if old else ''), 'PUT' if old else 'POST', payload, admin=True)
+              return value['name']
+
+          def tag_ruleset():
+              path = R + '/rulesets'
+              data = {'name': P + 'tag-ruleset', 'target': 'tag', 'enforcement': 'active',
+                      'conditions': {'ref_name': {'include': ['refs/tags/' + P + '*'], 'exclude': []}},
+                      'rules': [{'type': 'deletion'}, {'type': 'update'}]}
+              by_name(path + '?includes_parents=false', 'name', data['name'], data, admin=True, update='PUT')
+              record('tag_protection', 'API DOES NOT SUPPORT CREATION', data['name'], 'Tag ruleset (replacement)',
+                     'Legacy tag-protection REST endpoints were retired on GitHub.com. Created/reused current tag ruleset instead; legacy data was not created.')
+
+          def release():
+              tag = P + 'v1.0.0'
+              value = api(R + '/releases/tags/' + tag, missing=True)
+              if not value:
+                  value = api(R + '/releases', 'POST', {'tag_name': tag, 'name': P + 'release', 'draft': True,
+                      'prerelease': True, 'body': f"Harmless fixture for @{OWNER}. References #{ISSUES[0]['number']}."})
+              if not value['name'].startswith(P):
+                  raise RuntimeError('Tag belongs to a non-demo release; refusing modification')
+              record('releases', 'CREATED', value['html_url'], 'REST releases', 'Draft until asset upload succeeds; then prerelease.')
+              return value
+
+          def release_asset():
+              name = P + 'attachment.txt'
+              assets = listing(R + f"/releases/{RELEASE['id']}/assets")
+              asset = next((x for x in assets if x['name'] == name), None)
+              if not asset:
+                  url = RELEASE['upload_url'].split('{')[0] + '?name=' + name
+                  asset = api(url, 'POST', raw=b'Harmless migration discovery attachment.\n')
+              if RELEASE['draft']:
+                  api(R + f"/releases/{RELEASE['id']}", 'PATCH', {'draft': False})
+              record('assets', 'CREATED', asset['browser_download_url'], 'Release asset upload API')
+              issue_comment(ISSUES[0]['number'], 'asset-link', '[Demo file](' + asset['browser_download_url'] + ')')
+              record('attachments', 'API DOES NOT SUPPORT CREATION', asset['browser_download_url'], 'Release attachment + Markdown link',
+                     'Actual release asset uploaded; issue/PR user-attachments uploads have no supported public API. Use UI for those distinct objects.')
+
+          def pages():
+              old = api(R + '/pages', missing=True)
+              if old:
+                  source = old.get('source', {})
+                  if source.get('branch') != P + 'pages':
+                      record('pages', 'CONFIGURED', old.get('html_url', FULL), 'GET Pages', 'Existing site preserved; no non-demo Pages source modified.')
+                      return
+              # Isolated orphan branch prevents publishing existing repository files.
+              tree = api(R + '/git/trees', 'POST', {'tree': [{'path': 'index.html', 'mode': '100644', 'type': 'blob',
+                      'content': '<!doctype html><title>Migration demo</title><h1>Harmless discovery fixture</h1>'}]})
+              if not api(R + '/git/ref/heads/' + P + 'pages', missing=True):
+                  commit = api(R + '/git/commits', 'POST', {'message': P + 'Pages fixture', 'tree': tree['sha'], 'parents': []})
+                  branch(P + 'pages', commit['sha'])
+              if not old:
+                  # Site creation requires both Pages and Administration write.
+                  api(R + '/pages', 'POST', {'source': {'branch': P + 'pages', 'path': '/'}, 'build_type': 'legacy'}, admin=True)
+              api(R + '/pages/builds', 'POST')
+              record('pages', 'TRIGGERED/GENERATED INDIRECTLY', P + 'pages', 'Pages API + isolated HTML branch', 'Configured and build requested; policy/build may delay publication. Only harmless HTML is exposed.')
+
+          def projects():
+              cursor, project = None, None
+              while True:
+                  data = graphql('''query($org:String!,$cursor:String) {
+                    organization(login:$org) { id projectsV2(first:100,after:$cursor) {
+                      nodes { id title url } pageInfo { hasNextPage endCursor }
+                    } }
+                  }''', {'org': OWNER, 'cursor': cursor})['organization']
+                  project = next((x for x in data['projectsV2']['nodes'] if x['title'] == ORG_NAME + '-project'), project)
+                  if not data['projectsV2']['pageInfo']['hasNextPage']:
+                      break
+                  cursor = data['projectsV2']['pageInfo']['endCursor']
+              if not project:
+                  project = graphql('''mutation($owner:ID!,$title:String!) {
+                    createProjectV2(input:{ownerId:$owner,title:$title}) { projectV2 { id title url } }
+                  }''', {'owner': data['id'], 'title': ORG_NAME + '-project'})['createProjectV2']['projectV2']
+              # addProjectV2ItemById is idempotent for an existing content item.
+              for item in ISSUES + ([PR] if PR else []):
+                  graphql('''mutation($project:ID!,$content:ID!) {
+                    addProjectV2ItemById(input:{projectId:$project,contentId:$content}) { item { id } }
+                  }''', {'project': project['id'], 'content': item['node_id']})
+              graphql('''mutation($project:ID!,$repo:ID!) {
+                linkProjectV2ToRepository(input:{projectId:$project,repositoryId:$repo}) { repository { id } }
+              }''', {'project': project['id'], 'repo': INFO['node_id']})
+              return project['url']
+
+          def discussions():
+              cursor, discussion, repo_id, category_id = None, None, None, None
+              while True:
+                  data = graphql('''query($owner:String!,$name:String!,$cursor:String) {
+                    repository(owner:$owner,name:$name) { id
+                      discussionCategories(first:100) { nodes { id name } }
+                      discussions(first:100,after:$cursor) { nodes { id title url }
+                        pageInfo { hasNextPage endCursor } }
+                    }
+                  }''', {'owner': OWNER, 'name': REPO, 'cursor': cursor}, admin=False)['repository']
+                  repo_id = data['id']
+                  categories = data['discussionCategories']['nodes']
+                  if categories:
+                      category_id = next((x['id'] for x in categories if x['name'] == 'General'), categories[0]['id'])
+                  discussion = next((x for x in data['discussions']['nodes'] if x['title'] == P + 'discussion'), discussion)
+                  if not data['discussions']['pageInfo']['hasNextPage']:
+                      break
+                  cursor = data['discussions']['pageInfo']['endCursor']
+              if not category_id:
+                  raise RuntimeError('No discussion category; enable Discussions and initialize a category in UI')
+              if not discussion:
+                  discussion = graphql('''mutation($input:CreateDiscussionInput!) {
+                    createDiscussion(input:$input) { discussion { id url } }
+                  }''', {'input': {'repositoryId': repo_id, 'categoryId': category_id, 'title': P + 'discussion',
+                                  'body': f"Discovery discussion, related to #{ISSUES[0]['number']}."}}, admin=False)['createDiscussion']['discussion']
+              issue_comment(ISSUES[0]['number'], 'discussion-link', 'Discussion: ' + discussion['url'])
+              return discussion['url']
+
+          def cross_refs():
+              name = ORG_NAME + '-companion'
+              path = f'/repos/{OWNER}/{name}'
+              companion = api(path, admin=True, missing=True)
+              if not companion:
+                  companion = api(O + '/repos', 'POST', {'name': name, 'private': True, 'auto_init': True,
+                      'description': 'Disposable migration discovery companion', 'has_issues': True}, admin=True)
+              old = next((x for x in listing(path + '/issues?state=all', True) if x['title'] == P + 'cross-reference' and 'pull_request' not in x), None)
+              other = old or api(path + '/issues', 'POST', {'title': P + 'cross-reference',
+                  'body': f"References {FULL}#{ISSUES[0]['number']}" + (f" and {FULL}#{PR['number']}" if PR else '')}, admin=True)
+              issue_comment(ISSUES[0]['number'], 'cross-repo', f"Companion issue: {OWNER}/{name}#{other['number']}")
+              if PR:
+                  issue_comment(PR['number'], 'cross-repo-pr', f"Related to {OWNER}/{name}#{other['number']}")
+              return other['html_url']
+
+          def forks():
+              name = ORG_NAME + '-fork'
+              old = api(f'/repos/{OWNER}/{name}', admin=True, missing=True)
+              if old:
+                  if not old.get('fork') or old.get('parent', {}).get('full_name', '').lower() != FULL.lower():
+                      raise RuntimeError('Demo fork name occupied by a different repository; preserved')
+                  return old['html_url']
+              # Attempt only in the SAME disposable org, with one deterministic name.
+              # GitHub may disallow a second repo in the same fork network for an owner.
+              api(R + '/forks', 'POST', {'organization': OWNER, 'name': name, 'default_branch_only': True}, admin=True)
+              for _ in range(12):
+                  old = api(f'/repos/{OWNER}/{name}', admin=True, missing=True)
+                  if old and old.get('fork'):
+                      return old['html_url']
+                  time.sleep(5)
+              record('forks', 'TRIGGERED/GENERATED INDIRECTLY', name, 'POST fork; bounded polling', 'Accepted, but fork provisioning was not confirmed yet.')
+
+          def mentions():
+              team = '@' + OWNER + '/' + TEAM['slug'] if TEAM else '(team unavailable)'
+              text = f"Demo mentions: @{os.environ['GITHUB_ACTOR']}, @{OWNER}, {team}."
+              issue_comment(ISSUES[0]['number'], 'mentions', text)
+              if PR:
+                  issue_comment(PR['number'], 'mentions', text)
+              # CODEOWNERS in an isolated demo branch: no non-demo CODEOWNERS changed.
+              name = P + 'codeowners'
+              if not api(R + '/git/ref/heads/' + name, missing=True):
+                  tree = api(R + '/git/trees', 'POST', {'tree': [{'path': '.github/CODEOWNERS', 'mode': '100644',
+                      'type': 'blob', 'content': '# Disposable demo ownership\n* ' + ('@' + OWNER + '/' + TEAM['slug'] if TEAM else '@' + OWNER) + '\n'}]})
+                  commit = api(R + '/git/commits', 'POST', {'message': P + 'CODEOWNERS fixture', 'tree': tree['sha'], 'parents': []})
+                  branch(name, commit['sha'])
+              record('mentions', 'CREATED', FULL, 'Issue/PR comments and release body', 'Real dispatch actor attribution; mentions may notify existing members.')
+              record('codeowners', 'CREATED' if TEAM else 'REQUIRES EXISTING EXTERNAL ACTOR', name, 'Isolated CODEOWNERS branch',
+                     'Team has repository write permission.' if TEAM else 'No team available; org mention is illustrative, not an eligible code owner.')
+
+          def deployment():
+              path = R + '/deployments'
+              deployments = listing(path + '?environment=' + P + 'environment')
+              old = next((x for x in deployments if x.get('description') == P + 'deployment'), None)
+              value = old or api(path, 'POST', {'ref': P + 'base', 'environment': P + 'environment',
+                  'description': P + 'deployment', 'auto_merge': False, 'required_contexts': [], 'production_environment': False})
+              statuses = listing(path + f"/{value['id']}/statuses")
+              if not any(x['state'] == 'success' for x in statuses):
+                  api(path + f"/{value['id']}/statuses", 'POST', {'state': 'success', 'description': 'Metadata-only demo; no application deployed', 'auto_inactive': False})
+              return str(value['id'])
+          def security_configuration():
+              path = O + '/code-security/configurations'
+              name = ORG_NAME + '-security'
+              old = next((x for x in listing(path, True) if x['name'] == name), None)
+              payload = {'name': name, 'description': 'Disposable discovery security settings',
+                         'code_security': 'enabled', 'secret_protection': 'enabled',
+                         'dependency_graph': 'enabled', 'dependabot_alerts': 'enabled',
+                         'secret_scanning': 'enabled', 'secret_scanning_push_protection': 'enabled',
+                         'enforcement': 'unenforced'}
+              for field in ('dependency_graph_autosubmit_action', 'dependabot_security_updates',
+                            'code_scanning_default_setup', 'code_scanning_delegated_alert_dismissal',
+                            'secret_scanning_delegated_bypass', 'secret_scanning_validity_checks',
+                            'secret_scanning_non_provider_patterns', 'secret_scanning_generic_secrets',
+                            'secret_scanning_delegated_alert_dismissal', 'secret_scanning_extended_metadata',
+                            'private_vulnerability_reporting'):
+                  payload[field] = 'not_set'
+              value = api(path + (f"/{old['id']}" if old else ''), 'PATCH' if old else 'POST', payload, admin=True)
+              api(path + f"/{value['id']}/attach", 'POST', {'scope': 'selected', 'selected_repository_ids': [INFO['id']]}, admin=True)
+              # Attachment is asynchronous. Confirm association rather than assuming.
+              for _ in range(12):
+                  current = api(R + '/code-security-configuration', admin=True, missing=True)
+                  if current and current.get('configuration', {}).get('id') == value['id']:
+                      record('security_config', 'CONFIGURED', name, 'Code security configuration / selected repository attachment', 'Applies only to containing repository; may consume licensed security seats.')
+                      return
+                  time.sleep(5)
+              record('security_config', 'TRIGGERED/GENERATED INDIRECTLY', name, 'Security configuration attach API', 'Attachment accepted; association not yet confirmed.')
+
+          def secret_scanning():
+              value = api(R, 'PATCH', {'security_and_analysis': {'secret_scanning': {'status': 'enabled'},
+                         'secret_scanning_push_protection': {'status': 'enabled'}}}, admin=True)
+              state = value.get('security_and_analysis', {})
+              if state.get('secret_scanning', {}).get('status') != 'enabled':
+                  raise RuntimeError('Secret scanning enablement was not confirmed')
+              record('secret_config', 'CONFIGURED', FULL, 'PATCH repository security_and_analysis',
+                     'No credential-shaped test string is committed. Push protection remains enabled.')
+
+          def dependency_fixture():
+              # Manifest-only old dependency: never installed/imported/executed.
+              # A subdirectory manifest on the DEFAULT branch permits graph ingestion.
+              files = {
+                  P + 'dependencies/requirements.txt': 'Django==2.2.0\n',
+                  P + 'dependencies/README.md': '# Discovery only\nNever install these intentionally outdated manifest entries.\n',
+                  '.github/' + P + 'dependabot.yml': 'version: 2\nupdates:\n  - package-ecosystem: pip\n    directory: /migration-demo-dependencies\n    schedule:\n      interval: monthly\n    open-pull-requests-limit: 0\n',
+              }
+              sha = put_files(DEFAULT, files, P + 'dependency discovery fixture')
+              config_path = R + '/contents/.github/dependabot.yml'
+              canonical = api(config_path + '?ref=' + urllib.parse.quote(DEFAULT, safe=''), missing=True)
+              if not canonical:
+                  api(config_path, 'PUT', {'message': P + 'Dependabot configuration', 'branch': DEFAULT,
+                      'content': base64.b64encode(files['.github/' + P + 'dependabot.yml'].encode()).decode()})
+              api(R + '/vulnerability-alerts', 'PUT', admin=True)
+              record('dependabot_config', 'CONFIGURED', P + 'dependencies/requirements.txt', 'Default-branch manifest + vulnerability-alerts API',
+                     'Alerts enabled; canonical Dependabot config ' + ('already exists and was preserved.' if canonical else 'created for demo directory with zero version-update PRs.') +
+                     ' Dependency graph ingestion may be asynchronous; no dependency is installed.')
+              alerts = listing(R + '/dependabot/alerts?state=open', True)
+              demo_alerts = [x for x in alerts if x.get('dependency', {}).get('manifest_path', '').startswith(P)]
+              record('dependabot', 'CREATED' if demo_alerts else 'TRIGGERED/GENERATED INDIRECTLY',
+                     f'{len(demo_alerts)} observed demo alerts; manifest commit {sha}', 'Dependency graph / advisory matching',
+                     'Only existing alerts for demo manifests counted. Alert generation is asynchronous and depends on graph/policy/advisories.')
+
+          def sarif():
+              # Synthetic result explicitly identified as a fixture, not a CodeQL scan.
+              # Stable tool/category/fingerprint prevents a fresh alert on every run.
+              payload = {'version': '2.1.0', '$schema': 'https://json.schemastore.org/sarif-2.1.0.json', 'runs': [{
+                  'tool': {'driver': {'name': P + 'scanner', 'version': '1.0.0', 'rules': [{
+                      'id': P + 'fixture', 'shortDescription': {'text': 'Harmless synthetic discovery finding'},
+                      'help': {'text': 'Test metadata only. No vulnerable program is executed.'}}]}},
+                  'automationDetails': {'id': P + 'analysis/'},
+                  'results': [{'ruleId': P + 'fixture', 'level': 'warning',
+                      'message': {'text': 'Synthetic migration discovery result; not an actual vulnerability.'},
+                      'partialFingerprints': {'primaryLocationLineHash': hashlib.sha256(b'migration-demo-fixture-v1').hexdigest()},
+                      'locations': [{'physicalLocation': {'artifactLocation': {'uri': P + 'content/example.txt'},
+                                                        'region': {'startLine': 1}}}]}]}]}
+              blob = base64.b64encode(gzip.compress(json.dumps(payload).encode(), mtime=0)).decode()
+              value = api(R + '/code-scanning/sarifs', 'POST', {'commit_sha': BASE_SHA, 'ref': 'refs/heads/' + P + 'base',
+                          'sarif': blob, 'checkout_uri': 'file:///migration-demo/'})
+              for _ in range(18):
+                  result = api(R + '/code-scanning/sarifs/' + value['id'])
+                  if result.get('processing_status') == 'complete':
+                      alerts = listing(R + '/code-scanning/alerts?ref=' + urllib.parse.quote('refs/heads/' + P + 'base', safe=''))
+                      observed = [x for x in alerts if x.get('tool', {}).get('name') == P + 'scanner']
+                      record('sarif', 'CREATED' if observed else 'TRIGGERED/GENERATED INDIRECTLY', value['id'], 'SARIF upload / processing / alert query',
+                             f'Processing complete; {len(observed)} synthetic demo alerts observed.')
+                      return
+                  if result.get('processing_status') == 'failed':
+                      raise RuntimeError('SARIF processing failed: ' + json.dumps(result.get('errors', [])))
+                  time.sleep(5)
+              record('sarif', 'TRIGGERED/GENERATED INDIRECTLY', value['id'], 'SARIF upload', 'Accepted; processing still pending after bounded polling.')
+
+          def wiki():
+              work = ROOT / 'wiki'
+              # GitHub does not expose public API initialization of an empty wiki.
+              try:
+                  command(['git', 'clone', '--', SERVER + '/' + FULL + '.wiki.git', str(work)], admin=True)
+              except RuntimeError as error:
+                  record('wiki', 'REQUIRES EXISTING EXTERNAL ACTOR', FULL + '.wiki.git', 'Git wiki clone',
+                         'Create the first wiki page in UI (and grant bootstrap token access), then rerun. ' + str(error))
+                  return
+              filename = P + 'Discovery.md'
+              content = '# Migration discovery wiki\n\nHarmless page for [' + FULL + '](' + SERVER + '/' + FULL + ').\n'
+              page = work / filename
+              if not page.exists() or page.read_text() != content:
+                  page.write_text(content)
+                  command(['git', 'add', '--', filename], cwd=work, admin=True)
+                  command(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'user.name=Migration Demo',
+                           '-c', 'user.email=migration-demo@example.invalid', 'commit', '-m', P + 'wiki page'], cwd=work, admin=True)
+                  command(['git', 'push', 'origin', 'HEAD'], cwd=work, admin=True)
+              return FULL + '.wiki.git/' + filename
+
+          def lfs():
+              name = P + 'lfs'
+              if api(R + '/git/ref/heads/' + name, missing=True):
+                  # Confirm pointer metadata; do not assume a similarly named branch is LFS.
+                  value = api(R + '/contents/' + P + 'object.bin?ref=' + name)
+                  pointer = base64.b64decode(value.get('content', '')).decode('utf-8', 'replace')
+                  if not pointer.startswith('version https://git-lfs.github.com/spec/v1\n'):
+                      raise RuntimeError('Existing demo LFS branch lacks expected pointer')
+                  work = ROOT / 'lfs-verify'
+                  command(['git', 'clone', '--no-checkout', '--single-branch', '--branch', name, '--', SERVER + '/' + FULL + '.git', str(work)])
+                  command(['git', 'lfs', 'fetch', 'origin', name], cwd=work)
+                  record('lfs', 'CREATED', name, 'Git LFS fetch', 'Existing remote object downloaded successfully.')
+                  return name
+              work = ROOT / 'lfs'
+              work.mkdir(exist_ok=True)
+              command(['git', 'init', '-b', name], cwd=work)
+              command(['git', 'lfs', 'install', '--local'], cwd=work)
+              (work / '.gitattributes').write_text(P + 'object.bin filter=lfs diff=lfs merge=lfs -text\n')
+              (work / (P + 'object.bin')).write_bytes(b'Harmless migration discovery LFS fixture.\n')
+              command(['git', 'add', '--', '.gitattributes', P + 'object.bin'], cwd=work)
+              command(['git', '-c', 'user.name=Migration Demo', '-c', 'user.email=migration-demo@example.invalid',
+                       'commit', '-m', P + 'LFS object'], cwd=work)
+              command(['git', 'remote', 'add', 'origin', SERVER + '/' + FULL + '.git'], cwd=work)
+              command(['git', 'push', 'origin', 'HEAD:refs/heads/' + name], cwd=work)
+              return name
+
+          def packages():
+              # GHCR on github.com; GHE.com uses containers.<subdomain>.ghe.com.
+              host = urllib.parse.urlparse(SERVER).hostname
+              if host == 'github.com':
+                  registry = 'ghcr.io'
+              elif host.endswith('.ghe.com'):
+                  registry = 'containers.' + host
+              else:
+                  raise RuntimeError('Unsupported GHE Cloud registry hostname: ' + host)
+              image = registry + '/' + OWNER.lower() + '/' + ORG_NAME + '-package'
+              version = 'v1'
+              # Query package metadata first. GITHUB_TOKEN must have access if the
+              # organization already owns a same-named package from an earlier run.
+              path = O + '/packages/container/' + ORG_NAME + '-package'
+              existing = api(path, missing=True)
+              if existing:
+                  source = existing.get('repository') or {}
+                  if source.get('full_name', '').lower() != FULL.lower():
+                      raise RuntimeError('Existing package is not linked to this repository; preserved')
+                  versions = listing(path + '/versions')
+                  if any(version in x.get('metadata', {}).get('container', {}).get('tags', []) for x in versions):
+                      return image + ':' + version
+              work = ROOT / 'container'
+              work.mkdir(exist_ok=True)
+              (work / 'message.txt').write_text('Harmless migration discovery container.\n')
+              (work / 'Dockerfile').write_text('FROM scratch\nCOPY message.txt /message.txt\nLABEL org.opencontainers.image.source="' +
+                  SERVER + '/' + FULL + '"\nLABEL org.opencontainers.image.description="Disposable migration discovery fixture"\n')
+              # Isolated Docker credential directory removed in finally, never uploaded.
+              config = ROOT / 'docker-auth'
+              config.mkdir(mode=0o700, exist_ok=True)
+              try:
+                  command(['docker', '--config', str(config), 'login', registry, '-u', os.environ['GITHUB_ACTOR'], '--password-stdin'], stdin=TOKEN)
+                  command(['docker', '--config', str(config), 'build', '--network=none', '--build-arg', 'SOURCE_DATE_EPOCH=0',
+                           '-t', image + ':' + version, str(work)], timeout=300)
+                  command(['docker', '--config', str(config), 'push', image + ':' + version], timeout=300)
+                  command(['docker', '--config', str(config), 'manifest', 'inspect', image + ':' + version])
+              finally:
+                  for file in config.glob('*'):
+                      if file.is_file():
+                          file.unlink()
+              return image + ':' + version
+
+          def runner_inventory():
+              result = api(R + '/actions/runners', admin=True)
+              record('runners', 'UNSAFE/INAPPROPRIATE TO AUTOMATE', FULL, 'GET repository runners',
+                     f"Observed {result['total_count']} runners. Registration tokens alone are not runner records; no persistent machine is registered.")
+
+          def runner_group():
+              path = O + '/actions/runner-groups'
+              name = ORG_NAME + '-runner-group'
+              old = next((x for x in listing(path, True, 'runner_groups') if x['name'] == name), None)
+              if old and (old.get('inherited') or old.get('default')):
+                  raise RuntimeError('Refusing to update inherited/default runner group')
+              data = {'name': name, 'visibility': 'selected', 'allows_public_repositories': INFO['visibility'] == 'public',
+                      'restricted_to_workflows': True, 'selected_workflows': [os.environ['GITHUB_WORKFLOW_REF']]}
+              if old:
+                  value = api(path + f"/{old['id']}", 'PATCH', data, admin=True)
+                  api(path + f"/{old['id']}/repositories", 'PUT', {'selected_repository_ids': [INFO['id']]}, admin=True)
+              else:
+                  data.update(selected_repository_ids=[INFO['id']], runners=[])
+                  value = api(path, 'POST', data, admin=True)
+              record('runner_groups', 'CONFIGURED', name, 'Organization runner-group API',
+                     'Created without machines; restricted to this repository and this workflow. Existing demo-group machines, if any, are untouched.')
+
+          def large_runner_inventory():
+              result = api(O + '/actions/hosted-runners', admin=True)
+              record('large_runners', 'UNSAFE/INAPPROPRIATE TO AUTOMATE', OWNER, 'GET organization hosted-runners',
+                     f"Observed {result.get('total_count', 0)} larger runners. API creation provisions billable infrastructure; skipped intentionally.")
+
+          def installations():
+              value = api(O + '/installations', admin=True)
+              record('installations', 'REQUIRES EXISTING EXTERNAL ACTOR', OWNER, 'GET organization installations',
+                     f"Observed {value['total_count']} existing installations. App installation requires owner consent; none created.")
+
+          def initialize():
+              for key in INVENTORY:
+                  record(key, 'NOT ATTEMPTED', notes='Seeder has not reached this feature.')
+              askpass = ROOT / 'askpass.sh'
+              askpass.write_text('#!/bin/sh\ncase "$1" in\n*Username*) printf "%s\\n" x-access-token ;;\n*) printf "%s\\n" "$GH_TOKEN" ;;\nesac\n')
+              askpass.chmod(0o700)
+              record('wiki_attachments', 'API DOES NOT SUPPORT CREATION', mechanism='Wiki UI', notes='Upload wiki attachments manually; wiki Git pages are attempted separately.')
+              record('secret_remediation', 'UNSAFE/INAPPROPRIATE TO AUTOMATE', mechanism='Secret scanning',
+                     notes='No guaranteed inert official GitHub test pattern is assumed. No secrets committed and no existing alerts resolved. Configure scanning only.')
+              record('apps', 'REQUIRES EXISTING EXTERNAL ACTOR', mechanism='App manifest / registration UI', notes='App creation/installation requires an owner consent flow; no signing keys generated.')
+              record('personal_repos', 'NOT APPLICABLE TO GITHUB ENTERPRISE CLOUD SOURCE', mechanism='Organization guard', notes='Outside this organization-owned GEI discovery scope; GEC itself supports personal repositories.')
+              for key in ('stars', 'watchers', 'profiles'):
+                  record(key, 'REQUIRES EXISTING EXTERNAL ACTOR', mechanism='User account', notes='A consenting user must provide personal state. Workflow does not change bootstrap owner account state.')
+              for key in ('ssh', 'signing', 'pats'):
+                  record(key, 'UNSAFE/INAPPROPRIATE TO AUTOMATE', mechanism='User security settings', notes='Would create or modify authentication/signing material; deliberately excluded.')
+              record('mannequins', 'NOT APPLICABLE TO GITHUB ENTERPRISE CLOUD SOURCE', mechanism='GEI migration output', notes='Mannequins are created by import, not by source discovery fixtures. No migration runs.')
+              record('artifacts', 'NOT ATTEMPTED', mechanism='actions/upload-artifact', notes='Finalized after artifact upload step.')
+
+          def main():
+              global INFO, DEFAULT, INFO_SHA, ORG_NAME, ISSUES, BASE_SHA, FEATURE_SHA, PR, TEAM, PROTECTION, RELEASE
+              initialize()
+              if os.environ['DEMO_CONFIRM'] != 'YES-SEED-DEMO-DATA' or FULL != OWNER + '/' + REPO:
+                  raise RuntimeError('Intentional-execution / repository identity guard failed')
+              INFO = api(R)
+              if INFO['owner']['type'] != 'Organization':
+                  raise RuntimeError('Owner must be an organization')
+              if not ADMIN:
+                  REQUIRED_FAILURES.append('DEMO_ADMIN_TOKEN missing')
+              DEFAULT = INFO['default_branch']
+              INFO_SHA = api(R + '/git/ref/heads/' + urllib.parse.quote(DEFAULT, safe=''))['object']['sha']
+              ORG_NAME = P + str(INFO['id'])
+              record('repositories metadata', 'CONFIGURED', FULL, 'Existing containing repository', 'Bounded small fixtures; no size-limit stress test or large binary allocation.')
+              record('workflows', 'CREATED', os.environ['GITHUB_WORKFLOW_REF'], 'This workflow file', 'workflow_dispatch only; no push triggers or recursive dispatch.')
+              record('runs', 'TRIGGERED/GENERATED INDIRECTLY', SERVER + '/' + FULL + '/actions/runs/' + os.environ['GITHUB_RUN_ID'], 'Current workflow run', 'Each intentional rerun adds legitimate run history; retention is controlled by GitHub.')
+              run('settings pr_settings delete_head auto_merge merge squash rebase_setting', 'Repository settings API', repo_settings)
+              run('actions_settings', 'Repository Actions permission API', actions_settings)
+              ISSUES = run('labels milestones issues comments issue_edits comment_links reciprocal', 'REST issue graph', seed_core, required=True)
+              git_result = run('git refs', 'Git database REST APIs', seed_git, required=True)
+              if not ISSUES or not git_result:
+                  # Independent features still run; dependent features report dependency failures.
+                  ISSUES = ISSUES or []
+              BASE_SHA, FEATURE_SHA = git_result or (None, None)
+              PR = run('prs pr_edits', 'REST pull requests / comments', seed_prs, required=True) if ISSUES and BASE_SHA else None
+              run('pr_comments', 'COMMENT review / inline comment REST API', reviews, enabled=FULL_SEED and bool(PR))
+              run('subissues', 'POST issue sub_issues', subissues, enabled=bool(ISSUES))
+              run('commit_comments statuses', 'REST commit metadata', commit_metadata, enabled=bool(BASE_SHA))
+              run('topics', 'REST topics', topics)
+              TEAM = run('teams team_access', 'Organization teams API', teams, enabled=FULL_SEED)
+              run('team_members access', 'Existing member / team membership API', team_members, enabled=FULL_SEED and bool(TEAM))
+              run('collaborators', 'Existing org member collaborator API', collaborators, enabled=FULL_SEED)
+              run('member_privileges', 'Organization settings API', org_settings, enabled=os.environ['DEMO_ORG_SETTINGS'] == 'true')
+              run('default_branch', 'Organization read / settings UI', org_default)
+              run('repo_hooks hook_secrets', 'Repository webhook API', webhook, enabled=FULL_SEED)
+              run('org_hooks', 'Organization webhook API', lambda: webhook(True), enabled=FULL_SEED)
+              run('autolinks', 'Repository autolinks API', autolinks, enabled=FULL_SEED)
+              run('property_definitions properties', 'Organization schema / repository values API', properties, enabled=FULL_SEED)
+              env = run('environments', 'Environment API', environment)
+              run('env_protection', 'Environment protection APIs', env_protection, enabled=bool(env))
+              run('repo_secrets', 'gh secret set (libsodium sealed box)', lambda: demo_secret('repo'))
+              run('org_secrets', 'gh secret set --org (selected repository)', lambda: demo_secret('org'), enabled=FULL_SEED)
+              run('dependabot_secrets', 'gh secret set --app dependabot', lambda: demo_secret('repo', 'dependabot'), enabled=FULL_SEED)
+              run('codespaces', 'gh secret set --app codespaces', lambda: demo_secret('repo', 'codespaces'), enabled=FULL_SEED)
+              run('org_codespaces', 'gh secret set --org --app codespaces', lambda: demo_secret('org', 'codespaces'), enabled=FULL_SEED)
+              run('repo_vars', 'REST Actions variables', lambda: variable('repo'))
+              run('org_vars', 'REST organization variables', lambda: variable('org'), enabled=FULL_SEED)
+              run('env_secrets', 'Environment secret / variable APIs', lambda: (demo_secret('env'), variable('env')), enabled=bool(env))
+              PROTECTION = run('protection last_push force', 'Branch protection REST API', protection, enabled=FULL_SEED and bool(BASE_SHA))
+              run('bypass exceptions restrict_create', 'Branch protection actor options', protection_actors, enabled=bool(PROTECTION) and bool(TEAM))
+              run('lock', 'Branch protection lock_branch', locked_branch, enabled=FULL_SEED and bool(BASE_SHA))
+              run('required_deploy force_actors', 'GraphQL branch protection', graphql_protection, enabled=bool(PROTECTION) and bool(env))
+              run('rulesets', 'Repository rulesets API', rulesets, enabled=FULL_SEED)
+              run('org_rulesets', 'Organization rulesets API', lambda: rulesets(True), enabled=FULL_SEED)
+              run('tag_protection', 'Current tag ruleset API', tag_ruleset, enabled=FULL_SEED)
+              RELEASE = run('releases', 'Release API', release, enabled=bool(BASE_SHA) and bool(ISSUES))
+              run('assets attachments', 'Release upload / issue attachment link', release_asset, enabled=bool(RELEASE))
+              run('pages', 'Pages API', pages, enabled=FULL_SEED)
+              run('projects', 'GraphQL Projects V2', projects, enabled=FULL_SEED and bool(ISSUES))
+              run('discussions', 'GraphQL Discussions', discussions, enabled=FULL_SEED and bool(ISSUES))
+              run('cross_refs', 'Private companion repository and issue APIs', cross_refs, enabled=FULL_SEED and bool(ISSUES))
+              run('forks', 'Same-org fork API (no external target)', forks, enabled=FULL_SEED)
+              run('mentions codeowners', 'Mentions and isolated CODEOWNERS', mentions, enabled=FULL_SEED and bool(ISSUES))
+              run('rebase_links', 'PR merge API, rebase method', rebase_pr, enabled=FULL_SEED and bool(BASE_SHA) and bool(ISSUES))
+              run('deployments', 'Deployment/status API', deployment, enabled=FULL_SEED and bool(BASE_SHA) and bool(env))
+              run('wiki', 'Wiki Git remote', wiki, enabled=FULL_SEED)
+              run('lfs', 'Git LFS object push / fetch', lfs, enabled=FULL_SEED)
+              security = os.environ['DEMO_SECURITY'] == 'true'
+              run('security_config', 'Code security configuration APIs', security_configuration, enabled=security)
+              run('secret_config', 'Repository secret scanning API', secret_scanning, enabled=security)
+              run('dependabot_config dependabot', 'Manifest + Dependabot alerts API', dependency_fixture, enabled=security)
+              run('sarif', 'SARIF code scanning API', sarif, enabled=security and bool(BASE_SHA))
+              run('packages', 'Docker scratch + organization container registry', packages, enabled=os.environ['DEMO_PACKAGES'] == 'true')
+              run('runners', 'Runner inventory API', runner_inventory, enabled=FULL_SEED)
+              run('runner_groups', 'Empty runner-group metadata API', runner_group, enabled=FULL_SEED)
+              run('large_runners', 'Hosted-runner inventory API', large_runner_inventory, enabled=FULL_SEED)
+              run('installations', 'Organization installations API', installations, enabled=FULL_SEED)
+              record('audit activity history', 'TRIGGERED/GENERATED INDIRECTLY', FULL, 'Real API/Git mutations',
+                     'Actual workflow/bot/credential attribution; no historical users or timestamps forged. Audit visibility and retention depend on enterprise policy.')
+              record('search', 'TRIGGERED/GENERATED INDIRECTLY', FULL, 'GitHub indexing', 'Indexing is asynchronous; discovery fixtures do not force reindexing.')
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as error:
+                  REQUIRED_FAILURES.append('bootstrap: ' + clean(error))
+                  print('Required bootstrap failure: ' + clean(error))
+              finally:
+                  for key, value in list(ROWS.items()):
+                      if value['status'] == 'NOT ATTEMPTED' and key != 'artifacts':
+                          record(key, 'FAILED (REQUIRED)' if key in ('issues', 'git', 'prs') else 'FAILED (OPTIONAL)',
+                                 notes='Not reached because a prerequisite failed; see preceding feature failures.')
+                  (ROOT / 'result.json').write_text(json.dumps({'required_failures': REQUIRED_FAILURES}), encoding='utf-8')
+                  save()
+              sys.exit(1 if REQUIRED_FAILURES else 0)
+          PY
+
+      - name: Seed discovery data
+        id: seed
+        # Continue only to publish diagnostics; final step restores required failure.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEMO_ADMIN_TOKEN: ${{ secrets.DEMO_ADMIN_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$DEMO_DIR/seed.py"
+
+      - name: Upload coverage fixture artifact
+        id: artifact
+        if: ${{ always() && steps.seed.outcome != 'skipped' && steps.seed.outcome != '' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: migration-demo-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/migration-demo/coverage.json
+            ${{ runner.temp }}/migration-demo/result.json
+          if-no-files-found: error
+          retention-days: 7
+          # Only explicitly listed sanitized reports; never upload the working directory.
+
+      - name: Publish final coverage and enforce required failures
+        if: ${{ always() && steps.seed.outcome != 'skipped' && steps.seed.outcome != '' }}
+        env:
+          SEED_OUTCOME: ${{ steps.seed.outcome }}
+          ARTIFACT_OUTCOME: ${{ steps.artifact.outcome }}
+          ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import html
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ['DEMO_DIR'])
+          report = root / 'coverage.json'
+          rows = json.loads(report.read_text()) if report.exists() else {}
+          artifact_ok = os.environ['ARTIFACT_OUTCOME'] == 'success'
+          rows['artifacts'] = dict(item='Workflow artifacts', status='CREATED' if artifact_ok else 'FAILED (OPTIONAL)',
+              resource=os.environ.get('ARTIFACT_URL', ''), mechanism='actions/upload-artifact',
+              notes='Per-run report; seven-day retention. The uploaded JSON is the pre-upload snapshot; this summary includes the actual upload outcome.')
+          def cell(value):
+              return html.escape(str(value)).replace('|', '&#124;').replace('\n', '<br>')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('# Migration discovery coverage\n\n')
+              summary.write('Source inventory: [GitHub Enterprise Importer documentation](https://docs.github.com/en/migrations/using-github-enterprise-importer/migrating-between-github-products/about-migrations-between-github-products), reviewed 2026-09-08.\n\n')
+              summary.write('CREATED includes verified reuse; CONFIGURED describes settings. Indirect results are not proof of completed processing. HTTP 403/404 may mean permission, policy, licensing, or hidden resources; consult the recorded error. FAILED and SKIPPED are runtime outcomes, not claims of unsupported APIs.\n\n')
+              summary.write('| Documentation item | Status | Demo resource | API/mechanism | Notes |\n| --- | --- | --- | --- | --- |\n')
+              for value in rows.values():
+                  summary.write('| ' + ' | '.join(cell(value.get(k, '')) for k in ('item', 'status', 'resource', 'mechanism', 'notes')) + ' |\n')
+              if not report.exists():
+                  summary.write('\nRequired failure: seeder did not produce a coverage report. Inspect step logs.\n')
+              result = root / 'result.json'
+              failures = json.loads(result.read_text()).get('required_failures', []) if result.exists() else ['Missing seed result']
+              if failures:
+                  summary.write('\nRequired failures: ' + cell(', '.join(failures)) + '\n')
+          if os.environ['SEED_OUTCOME'] != 'success' or failures:
+              raise SystemExit('Required seed failed; coverage report was published.')
+          PY
